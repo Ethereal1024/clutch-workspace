@@ -3,7 +3,9 @@
 Deltas are exactly the frozen "pure capability" cuts — nothing else:
 - no Workspace object: paths resolve against the process CWD (`_resolve`),
   so "the workspace" is whatever cwd the caller spawns us with
-- no protected set / snapshots / containment: every path is servable
+- no protected set / containment: every path is servable. The fence and the
+  undo stack are daemon policy (daemon.py); this module only exposes the two
+  tiny snapshot primitives that policy needs (`previous_content`, `restore`)
 - no error prose templates: failures raise CommandError(code, brief); the
   caller owns the long-form prose
 - output-channel formats (hit grouping, continuation hints, the grep cap
@@ -170,6 +172,29 @@ def grep(pattern: str, path: str = ".", include: str = "") -> Result:
     if len(out) >= _GREP_MAX_HITS:
         content += "\n\n(Results capped at 100; use a more specific pattern or path.)"
     return Result(content)
+
+
+def previous_content(path: str) -> str | None:
+    """The file's current text, or None when it does not exist (daemon undo:
+    the daemon records this before a write/edit and hands it back to
+    `restore` on undo). Same read discipline as the commands themselves."""
+    try:
+        return _read_text(_resolve(path))
+    except FileNotFoundError:
+        return None
+
+
+def restore(path: str, content: str | None) -> str:
+    """The undo half of the pair: put `content` back (None = the file did not
+    exist, so remove it). Same write discipline as write_file — utf-8,
+    newline='\\n', parents auto-created — so a restored file is byte-exact."""
+    p = _resolve(path)
+    if content is None:
+        p.unlink(missing_ok=True)
+        return f"OK: undid {path} (created file removed)"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(content, encoding="utf-8", newline="\n")
+    return f"OK: undid {path} (restored {len(content)} chars)"
 
 
 def _grep_files(dirpath: Path) -> list[Path]:

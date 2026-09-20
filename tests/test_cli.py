@@ -17,7 +17,7 @@ from clutch_workspace.exitcodes import EX_IOERR, EX_NOINPUT, EX_SIGINT, EX_SOFTW
 def test_version(run):
     proc = run("--version")
     assert proc.returncode == 0
-    assert proc.stdout == "clutch-workspace 0.1.0\n"
+    assert proc.stdout == "clutch-workspace 0.2.0\n"
 
 
 def test_no_args_prints_usage_and_exits_64(run):

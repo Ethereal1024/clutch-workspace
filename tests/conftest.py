@@ -14,9 +14,18 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:  # lets tests import clutch_workspace for constants
     sys.path.insert(0, str(ROOT))
 
+# daemon OFF for the whole pytest PROCESS, not just spawned children: tests
+# that drive cli.main in-process would otherwise lazy-start real daemons and
+# dodge their monkeypatches. Daemon tests opt back in per-test with
+# CLUTCH_WORKSPACE_NO_SERVER=0 (monkeypatch restores this afterwards).
+os.environ.setdefault("CLUTCH_WORKSPACE_NO_SERVER", "1")
+
 
 def _run(*args: object, cwd: Path | str, stdin: str | None = None):
+    # daemon OFF by default here so the whole suite exercises the direct
+    # path; daemon tests opt back in with CLUTCH_WORKSPACE_NO_SERVER=0
     env = dict(os.environ, PYTHONPATH=str(ROOT), PYTHONUTF8="1")
+    env.setdefault("CLUTCH_WORKSPACE_NO_SERVER", "1")
     return subprocess.run(
         [sys.executable, "-m", "clutch_workspace", *(str(a) for a in args)],
         cwd=str(cwd),
