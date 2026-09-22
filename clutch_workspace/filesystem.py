@@ -4,8 +4,10 @@ Deltas are exactly the frozen "pure capability" cuts — nothing else:
 - no Workspace object: paths resolve against the process CWD (`_resolve`),
   so "the workspace" is whatever cwd the caller spawns us with
 - no protected set / containment: every path is servable. The fence and the
-  undo stack are daemon policy (daemon.py); this module only exposes the two
-  tiny snapshot primitives that policy needs (`previous_content`, `restore`)
+  undo stack are daemon policy (daemon.py); this module only takes the
+  policy's hooks — the two tiny snapshot primitives (`previous_content`,
+  `restore`) and an optional `skip` hide predicate on the two discovery
+  commands (read_file's directory listing, grep's walk)
 - no error prose templates: failures raise CommandError(code, brief); the
   caller owns the long-form prose
 - output-channel formats (hit grouping, continuation hints, the grep cap
@@ -28,13 +30,21 @@ _GREP_MAX_HITS = 100
 _GREP_LINE_MAX = 300
 
 
-def read_file(path: str, offset: int = 0, limit: int = 0, max_chars: int = READ_MAX_CHARS) -> Result:
+def read_file(
+    path: str,
+    offset: int = 0,
+    limit: int = 0,
+    max_chars: int = READ_MAX_CHARS,
+    skip: Callable[[str], bool] | None = None,
+) -> Result:
     """Read a file (or, with no range flags, list a directory).
 
     No range flags: raw text, truncated at the char budget with a hint that
     points at the first unread line. With range flags: 1-based numbered
     lines [offset, offset+limit) — a range that cannot fit the budget is an
-    error, not a silent truncation.
+    error, not a silent truncation. `skip` is the caller's hide predicate
+    (the daemon's fence): a directory listing drops every entry it accepts,
+    which is how a fenced file stays invisible to `read_file <dir>`.
     """
     limit_chars = max_chars or READ_MAX_CHARS  # --max-chars 0 means "the default", like the host
     p = _resolve(path)
@@ -43,8 +53,17 @@ def read_file(path: str, offset: int = 0, limit: int = 0, max_chars: int = READ_
             # usage-level: the flags contradict the input kind (64, not 65)
             raise CommandError(EX_USAGE, "cannot read a line range of a directory; list it without offset/limit")
         # byte-identical to the host: suffixed names, plain lexicographic sort,
-        # dotfiles INCLUDED (only grep hides them)
-        entries = sorted(e.name + ("/" if e.is_dir() else "") for e in p.iterdir())
+        # dotfiles INCLUDED (only grep hides them). Directories carry their
+        # trailing slash into the skip predicate, so a glob that fences a whole
+        # tree ("secrets/*") also hides the directory entry itself.
+        kept: list[str] = []
+        for entry in p.iterdir():
+            name = entry.name + ("/" if entry.is_dir() else "")
+            rel = _rel(entry)
+            if skip is not None and skip(rel + "/" if entry.is_dir() else rel):
+                continue
+            kept.append(name)
+        entries = sorted(kept)
         return Result("\n".join(entries) if entries else "(empty directory)")
     try:
         text = _read_text(p)
@@ -126,9 +145,14 @@ def edit_file(path: str, old_string: str, new_string: str) -> Result:
     return Result(f"OK: edited {path} (+{adds} -{dels} lines)", diff=diff)
 
 
-def grep(pattern: str, path: str = ".", include: str = "") -> Result:
+def grep(pattern: str, path: str = ".", include: str = "", skip: Callable[[str], bool] | None = None) -> Result:
     """Regex search over text files under path, capped at 100 hits, grouped
-    per file with a blank line between groups."""
+    per file with a blank line between groups. `skip` is the caller's hide
+    predicate (the daemon's fence): a file discovered by the walk is never
+    searched when it matches, so fenced content cannot leak through a
+    workspace-wide grep. A file named explicitly as `path` is served — the
+    predicate guards discovery, not deliberate access (same rule as
+    read_file's directory listing)."""
     try:
         rx = re.compile(pattern)
     except re.error as e:
@@ -138,10 +162,13 @@ def grep(pattern: str, path: str = ".", include: str = "") -> Result:
     root = _resolve(path)
     if not root.is_file() and not root.is_dir():
         raise CommandError(EX_NOINPUT, f"file not found: {path}")
-    files = [root] if root.is_file() else _grep_files(root)
+    explicit = root.is_file()
+    files = [root] if explicit else _grep_files(root)
     out: list[tuple[str, int, str]] = []
     for f in files:
         rel = _rel(f)
+        if not explicit and skip is not None and skip(rel):
+            continue
         if include and not (fnmatch.fnmatch(f.name, include) or fnmatch.fnmatch(rel, include)):
             continue
         if _is_binary(f):

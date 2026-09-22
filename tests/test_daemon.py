@@ -309,14 +309,47 @@ def test_fence_refuses_mutations_with_77(spawn, run, tmp_path):
     code, _ = _forward_json(run, "write_file", "--path", "open.txt", "--content", "x")
     assert code == 0, "unfenced paths keep working"
 
-    # an existing fenced file: edit refused too; reads still pass (mutation-only
-    # fence — which fences move is still carry-over ①)
+    # an existing fenced file: edit refused too; naming the path explicitly
+    # still serves it (the fence guards mutation + discovery, not deliberate
+    # access — the hide half is test_fence_hides_from_listings_and_grep)
     (tmp_path / "secret.txt").write_text("v1\n", encoding="utf-8")
     code, _ = _forward_json(run, "edit_file", "--path", "secret.txt", "--old-string", "v1", "--new-string", "v2")
     assert code == EX_NOPERM
     assert (tmp_path / "secret.txt").read_text(encoding="utf-8") == "v1\n"
     code, env = _forward_json(run, "read_file", "--path", "secret.txt")
     assert code == 0 and "v1" in env["content"]
+
+
+def test_fence_hides_from_listings_and_grep(spawn, run, tmp_path):
+    """The discovery half of the fence: a directory listing drops fenced
+    entries and a workspace-wide grep never searches them, so content cannot
+    leak through a broad scan — while naming the path explicitly still serves
+    it (the same deliberate-access rule read_file keeps)."""
+    spawn(tmp_path, "--protect", "secret*", "--protect", "secrets/*")
+    (tmp_path / "secret.txt").write_text("top secret\n", encoding="utf-8")
+    (tmp_path / "open.txt").write_text("hello\n", encoding="utf-8")
+    (tmp_path / "secrets").mkdir()
+    (tmp_path / "secrets" / "x.txt").write_text("deep secret\n", encoding="utf-8")
+
+    # a listing of the workspace hides the fenced file AND the fenced tree
+    code, env = _forward_json(run, "read_file", "--path", ".")
+    assert code == 0
+    listing = env["content"].splitlines()
+    assert "open.txt" in listing
+    assert "secret.txt" not in listing, "a fenced file must not appear in a listing"
+    assert "secrets/" not in listing, "'secrets/*' fences the directory entry itself"
+
+    # a workspace-wide grep never searches fenced content
+    code, env = _forward_json(run, "grep", "--pattern", "secret", "--path", ".")
+    assert code == 0 and env["content"] == "(no matches)", env["content"]
+
+    # explicit access is deliberate: the file itself is still served
+    code, env = _forward_json(run, "grep", "--pattern", "secret", "--path", "secret.txt")
+    assert code == 0 and "top secret" in env["content"]
+
+    # unfenced content is untouched
+    code, env = _forward_json(run, "grep", "--pattern", "hello", "--path", ".")
+    assert code == 0 and "open.txt:" in env["content"]
 
 
 def _forward_json(run, *args: str):

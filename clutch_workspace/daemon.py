@@ -36,6 +36,12 @@ No reconfigure endpoint on purpose (ratified): the fence is whatever
 --protect globs the daemon was STARTED with; to change it, /shutdown and
 let the next CLI call lazy-start a fresh daemon (which also drops undo).
 
+The fence has two faces, both from one matcher: a mutation of a fenced path
+is refused with 77, and discovery of a fenced path is hidden (a directory
+listing drops the entry; grep never searches a file it found by walking).
+Naming a fenced path explicitly still serves it — the fence guards writes
+and broad scans, not deliberate access.
+
 Lifecycle: an idle watchdog exits the daemon after --idle seconds without
 any request (default 600 ≈ 10 minutes), SIGTERM/SIGINT exit gracefully,
 and both paths remove the discovery file. A crash leaves the file behind,
@@ -137,12 +143,15 @@ class Daemon:
                 offset=int(a.get("offset") or 0),
                 limit=int(a.get("limit") or 0),
                 max_chars=int(a.get("max_chars") or 0),
+                skip=self._hidden,
             )
         except (TypeError, ValueError):
             raise _BadRequest("offset/limit/max_chars must be integers") from None
 
     def _grep(self, a: dict) -> Result:
-        return filesystem.grep(a["pattern"], path=a.get("path", "."), include=a.get("include", ""))
+        return filesystem.grep(
+            a["pattern"], path=a.get("path", "."), include=a.get("include", ""), skip=self._hidden
+        )
 
     def _write(self, a: dict) -> Result:
         self._fence(a["path"])
@@ -172,20 +181,42 @@ class Daemon:
             self.undo.pop(0)
 
     # -- fence (daemon policy, not a filesystem capability) --------------
+    #
+    # One fence, two faces:
+    #   * mutations of a fenced path are refused with 77 (--protect is a
+    #     write barrier);
+    #   * discovery of a fenced path is hidden — a directory listing drops
+    #     the entry and grep never searches the file — so fenced content
+    #     cannot leak through a broad scan.
+    # Naming a fenced path explicitly still serves it (read_file/grep on the
+    # path itself), which is the deliberate-access half of the same rule:
+    # only expansion of a directory/walk consults the hide predicate. Both
+    # faces come from _fence_hit, so a fence can never disagree with itself.
 
-    def _fence(self, path: str) -> None:
-        """Refuse mutations of fenced paths with 77. Mutation-only for now —
-        reads still see fenced files (which fences move is carry-over ①,
-        still pending). Matched against the path as given, its basename, its
-        CWD-relative form in both separator flavors, and every directory
-        suffix of that form, so 'secret*', '*.env' and 'secrets/*' all behave
-        as written ('secrets/*' also catches deep/secrets/x.txt)."""
+    def _fence_hit(self, path: str) -> str | None:
+        """The first --protect glob matching `path`, or None. Matched against
+        the path as given, its basename, its CWD-relative form in both
+        separator flavors, and every directory suffix of that form, so
+        'secret*', '*.env' and 'secrets/*' all behave as written
+        ('secrets/*' also catches deep/secrets/x.txt)."""
         if not self.protect:
-            return
+            return None
         for candidate in _fence_candidates(path):
             for glob in self.protect:
                 if fnmatch.fnmatch(candidate, glob):
-                    raise CommandError(EX_NOPERM, f"path is protected (--protect {glob}): {path}")
+                    return glob
+        return None
+
+    def _fence(self, path: str) -> None:
+        """Refuse a mutation of a fenced path (77) — the write barrier."""
+        glob = self._fence_hit(path)
+        if glob is not None:
+            raise CommandError(EX_NOPERM, f"path is protected (--protect {glob}): {path}")
+
+    def _hidden(self, rel: str) -> bool:
+        """The hide predicate handed to filesystem's discovery walks: True
+        when a CWD-relative path matches a fence glob."""
+        return self._fence_hit(rel) is not None
 
     # -- lifecycle --------------------------------------------------------
 
@@ -330,7 +361,7 @@ def build_parser() -> argparse.ArgumentParser:
         allow_abbrev=False,
     )
     parser.add_argument("--workspace", required=True, metavar="DIR", help="directory to serve; the daemon chdirs here")
-    parser.add_argument("--protect", action="append", default=[], metavar="GLOB", help="fence: refuse mutations of matching paths with exit 77 (repeatable)")
+    parser.add_argument("--protect", action="append", default=[], metavar="GLOB", help="fence: refuse mutations of matching paths with exit 77 and hide them from directory listings/grep (repeatable)")
     parser.add_argument("--idle", type=float, default=DEFAULT_IDLE_SECONDS, metavar="SECONDS", help=f"exit after this much inactivity (default {DEFAULT_IDLE_SECONDS:g})")
     parser.add_argument("--port", type=int, default=0, metavar="N", help="port to bind (default: a random free port)")
     return parser
