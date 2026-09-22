@@ -23,8 +23,9 @@ illegal status lines — so they travel in the body. The other three fields
 are exactly the CLI's {"content", "error", "diff"} envelope, so the thin
 client re-emits byte-identically and just maps code → exit status. The
 transport statuses (403 bad token, 400 bad JSON or missing field, 404
-unknown path) carry no verdict: the client treats them as "no usable daemon"
-and falls back.
+unknown path) carry no verdict: they mean no daemon is speaking the
+protocol, which the client reports as a failure (74) — there is no
+in-process path to fall back to.
 
 Undo lives HERE (ratified: daemon memory, not disk): every write/edit that
 succeeds pushes {path, before, existed}, capped at the 100 most recent;
@@ -60,7 +61,7 @@ from pathlib import Path
 
 from . import discovery, filesystem
 from .envelope import CommandError, Result
-from .exitcodes import EX_NOINPUT, EX_NOPERM, EX_SOFTWARE, EX_USAGE
+from .exitcodes import EX_IOERR, EX_NOINPUT, EX_NOPERM, EX_SOFTWARE, EX_USAGE
 
 DEFAULT_IDLE_SECONDS = 600.0
 UNDO_MAX = 100
@@ -292,10 +293,12 @@ class _Handler(BaseHTTPRequestHandler):
             return self._respond(400, _transport_err("request body must be one JSON object"))
         try:
             result = d.route(self.path, payload)
-        except _BadRequest as err:  # a client bug, not a verdict: the direct
-            return self._respond(400, _transport_err(str(err)))  # path will judge it properly
+        except _BadRequest as err:  # a client bug, not a verdict: no "code"
+            return self._respond(400, _transport_err(str(err)))  # field, so the client fails loudly
         except CommandError as err:  # the command's verdict rides 200 in "code"
             return self._respond(200, _verdict_err(err.code, err.message))
+        except OSError as err:  # a filesystem-level failure is the CLI's 74 (EX_IOERR)
+            return self._respond(200, _verdict_err(EX_IOERR, str(err)))
         except Exception as err:  # noqa: BLE001 - name it a bug, keep serving
             traceback.print_exc()
             return self._respond(200, _verdict_err(EX_SOFTWARE, f"internal error: {err}"))

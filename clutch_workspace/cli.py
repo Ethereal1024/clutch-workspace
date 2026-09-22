@@ -1,4 +1,4 @@
-"""Flag wiring: argparse -> filesystem commands -> envelope out.
+"""Flag wiring: argparse -> the per-workspace daemon -> envelope out.
 
   clutch-workspace [--json] <command> [flags]
 
@@ -7,22 +7,20 @@
 - --json: ONE compact {"content", "error", "diff"} line on stdout for
   BOTH outcomes; callers parse stdout plus the exit code, never prose.
   It is a global flag and must precede the subcommand.
-- daemon mode (default): the command rides a per-workspace HTTP daemon
-  when one is alive (or can be lazy-started); its envelope is re-emitted
-  byte-identically. When the daemon is absent AND cannot be started the
-  command runs in-process, same bytes, same code — the daemon is an
-  accelerator, not a dependency. `--no-server` (or
-  CLUTCH_WORKSPACE_NO_SERVER=1) forces the direct path; `--workspace DIR`
-  serves DIR instead of the CWD (the daemon is keyed on it, and direct
-  execution chdirs there first).
+- Every command rides the per-workspace daemon: the client finds a live
+  one or lazy-starts a fresh one, then re-emits its envelope
+  byte-for-byte. The daemon is the ONLY execution path — a command that
+  cannot reach or start a daemon fails (66 when the workspace dir is
+  missing, 74 otherwise) rather than running in-process. `--workspace DIR`
+  serves DIR instead of the CWD (the daemon is keyed on it).
 A payload flag value of `-` reads the value from stdin (write_file
 --content, edit_file --old-string/--new-string) so bodies beyond the
 Windows 32K argv limit still get through. Only ONE flag per invocation
 may use `-` — two would drain the same stream twice.
 
 Usage errors (bad flags, unknown command, contradictory arguments —
-argparse's own included) exit 64; I/O failures 74; a bug that escapes is
-70, never masquerading as caller error.
+argparse's own included) exit 64; an unreachable daemon 74; a bug that
+escapes is 70, never masquerading as caller error.
 """
 
 from __future__ import annotations
@@ -32,7 +30,7 @@ import os
 import sys
 import traceback
 
-from . import __version__, client, filesystem
+from . import __version__, client
 from .envelope import CommandError, Result, emit_error, emit_result
 from .exitcodes import EX_IOERR, EX_SIGINT, EX_SOFTWARE, EX_USAGE
 from .filesystem import READ_MAX_CHARS
@@ -51,8 +49,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--json", action="store_true", help="emit one JSON envelope line on stdout instead of human text")
     parser.add_argument("--version", action="version", version=f"clutch-workspace {__version__}")
-    parser.add_argument("--workspace", default="", metavar="DIR", help="serve DIR instead of the CWD (keys the daemon; direct execution chdirs there)")
-    parser.add_argument("--no-server", action="store_true", help="skip the workspace daemon and always execute in-process (also CLUTCH_WORKSPACE_NO_SERVER=1)")
+    parser.add_argument("--workspace", default="", metavar="DIR", help="serve DIR instead of the CWD (keys the daemon)")
     sub = parser.add_subparsers(dest="command", metavar="<command>", required=True)
 
     read = sub.add_parser("read_file", help="read a file (or list a directory); numbered ranges with continuation hints")
@@ -94,8 +91,8 @@ def _check_args(args: argparse.Namespace) -> None:
 
 def _prepare(args: argparse.Namespace) -> tuple[str, dict]:
     """The command name plus its payload — with stdin payloads drained
-    EXACTLY once, before any forwarding, so a daemon fallback cannot find
-    an already-drained stdin."""
+    EXACTLY once, before forwarding, so nothing downstream touches the
+    stream again."""
     if args.command == "read_file":
         return "read_file", {"path": args.path, "offset": args.offset, "limit": args.limit, "max_chars": args.max_chars}
     if args.command == "grep":
@@ -113,55 +110,25 @@ def _prepare(args: argparse.Namespace) -> tuple[str, dict]:
     raise CommandError(EX_USAGE, f"unknown command: {args.command}")  # unreachable: subparsers required
 
 
-_EXECUTE = {
-    "read_file": lambda p: filesystem.read_file(p["path"], offset=p["offset"], limit=p["limit"], max_chars=p["max_chars"]),
-    "grep": lambda p: filesystem.grep(p["pattern"], path=p["path"], include=p["include"]),
-    "write_file": lambda p: filesystem.write_file(p["path"], content=p["content"]),
-    "edit_file": lambda p: filesystem.edit_file(p["path"], old_string=p["old_string"], new_string=p["new_string"]),
-}
-
-
 def _execute(args: argparse.Namespace) -> Result:
-    """One command: through the daemon when possible, direct otherwise."""
+    """One command: always through the per-workspace daemon."""
     command, payload = _prepare(args)
     workspace = os.path.abspath(args.workspace or os.getcwd())
-    if _server_enabled(args):
-        served = _via_daemon(workspace, command, payload)
-        if served is not None:
-            return served
-    os.chdir(workspace)  # the direct path honors --workspace too (74 if it cannot)
-    return _EXECUTE[command](payload)
-
-
-def _server_enabled(args: argparse.Namespace) -> bool:
-    return not args.no_server and not client.disabled()
-
-
-def _via_daemon(workspace: str, command: str, payload: dict) -> Result | None:
-    """Forward one command; None means 'no daemon for you, run it directly'.
-    The daemon answers EVERY command with HTTP 200 and carries the verdict
-    in the envelope's transport-only "code" field (0 ok, else the sysexits
-    code); content/error/diff are exactly the CLI's envelope, so re-emitting
-    it is byte-identical to local execution."""
-    if not os.path.isdir(workspace):
-        return None  # nothing to serve: keep direct semantics (missing input stays 66/74, etc.)
-    endpoint = client.endpoint(workspace)
-    if endpoint is None:
-        return None  # absent and not startable: silent fallback (ratified)
-    base, token = endpoint
+    try:
+        base, token = client.endpoint(workspace)
+    except client.DaemonUnavailable as err:
+        raise CommandError(err.code, str(err)) from None
     try:
         status, env = client.forward(base, token, command, payload)
     except client.DaemonUnreachable as err:
         # it was alive a moment ago; the command may have half-happened, so
-        # re-running locally is NOT safe (edit_file is not idempotent)
+        # re-running is NOT safe (edit_file is not idempotent)
         raise CommandError(EX_IOERR, str(err)) from None
     if status != 200:
         # a non-200 is transport trouble (403 bad token / 400 bad JSON / 404
-        # unknown path), never the command's verdict: this daemon is not what
-        # its discovery entry promises — forget it and run directly, exactly
-        # as if it had never been there
-        client.forget(workspace)
-        return None
+        # unknown path), never the command's verdict: no daemon spoke the
+        # protocol and there is no other path to the filesystem
+        raise CommandError(EX_IOERR, env.get("content") or f"workspace daemon returned HTTP {status}")
     if env.get("error"):
         code = env.get("code")  # a non-int code is a daemon bug, not caller error
         raise CommandError(code if isinstance(code, int) else EX_SOFTWARE, env.get("content", "command failed"))

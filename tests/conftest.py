@@ -1,6 +1,11 @@
 """Black-box harness: every test drives the real CLI as a subprocess
 (`python -m clutch_workspace`), the way the host transport will — no imports
-of the module under test for behavior, only for the exit-code table."""
+of the module under test for behavior, only for the exit-code table.
+
+The daemon is the CLI's only execution path, so every test needs one: the
+autouse fixture below gives each test its own discovery directory and shuts
+down whatever daemons it lazy-started.
+"""
 
 import json
 import os
@@ -14,18 +19,26 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:  # lets tests import clutch_workspace for constants
     sys.path.insert(0, str(ROOT))
 
-# daemon OFF for the whole pytest PROCESS, not just spawned children: tests
-# that drive cli.main in-process would otherwise lazy-start real daemons and
-# dodge their monkeypatches. Daemon tests opt back in per-test with
-# CLUTCH_WORKSPACE_NO_SERVER=0 (monkeypatch restores this afterwards).
-os.environ.setdefault("CLUTCH_WORKSPACE_NO_SERVER", "1")
+from clutch_workspace import client  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def daemon_home(tmp_path_factory, monkeypatch):
+    """Isolate rendezvous state per test and reap the daemons it started."""
+    disc = tmp_path_factory.mktemp("discovery")
+    monkeypatch.setenv("CLUTCH_WORKSPACE_DISCOVERY_DIR", str(disc))
+    yield disc
+    # sweep: no daemon may outlive a test
+    for leftover in disc.glob("d-*.json"):
+        try:
+            payload = json.loads(leftover.read_text(encoding="utf-8"))
+            client.shutdown(f"http://127.0.0.1:{payload['port']}", payload["token"])
+        except (OSError, ValueError, KeyError):
+            pass
 
 
 def _run(*args: object, cwd: Path | str, stdin: str | None = None):
-    # daemon OFF by default here so the whole suite exercises the direct
-    # path; daemon tests opt back in with CLUTCH_WORKSPACE_NO_SERVER=0
     env = dict(os.environ, PYTHONPATH=str(ROOT), PYTHONUTF8="1")
-    env.setdefault("CLUTCH_WORKSPACE_NO_SERVER", "1")
     return subprocess.run(
         [sys.executable, "-m", "clutch_workspace", *(str(a) for a in args)],
         cwd=str(cwd),

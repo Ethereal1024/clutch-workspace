@@ -1,14 +1,13 @@
 """CLI surface: envelope shape, --json placement, exit-code contract, exotic failures.
 
-The black-box tests go through subprocesses; the three failure paths that are
-awkward to provoke in a child (broken pipe, SIGINT, internal bug) run main()
-in-process with patched streams/collaborators.
+The black-box tests go through subprocesses; the failure paths that are awkward
+to provoke in a child (broken pipe, SIGINT, an unreachable daemon, a daemon bug)
+run main() in-process against a canned transport. There is no in-process
+execution path left, so those tests patch the client, never the filesystem.
 """
 
 import json
 import sys
-
-import pytest
 
 from clutch_workspace import cli
 from clutch_workspace.exitcodes import EX_IOERR, EX_NOINPUT, EX_SIGINT, EX_SOFTWARE, EX_USAGE
@@ -90,21 +89,68 @@ class _DeadPipe:
         pass
 
 
-def test_broken_pipe_is_ioerr(monkeypatch, tmp_path):
-    (tmp_path / "f.txt").write_text("x", encoding="utf-8")
+def _canned(monkeypatch, endpoint=None, forward=None):
+    """Stand in for the daemon: these tests are about what the CLI does with a
+    reply (or the lack of one), not about the transport. Patching the client
+    module is the only seam left — the CLI itself never touches the filesystem."""
+    monkeypatch.setattr(cli.client, "endpoint", endpoint or (lambda workspace: ("http://127.0.0.1:9", "tok")))
+    if forward is not None:
+        monkeypatch.setattr(cli.client, "forward", forward)
+
+
+def _raises(exc: BaseException):
+    def boom(*_args, **_kwargs):
+        raise exc
+
+    return boom
+
+
+def test_broken_pipe_is_ioerr(monkeypatch):
+    _canned(monkeypatch, forward=lambda *a, **k: (200, {"content": "x", "error": False, "diff": "", "code": 0}))
     monkeypatch.setattr(sys, "stdout", _DeadPipe())
-    monkeypatch.chdir(tmp_path)
     assert cli.main(["read_file", "--path", "f.txt"]) == EX_IOERR
 
 
-def test_keyboard_interrupt_is_130(monkeypatch, tmp_path):
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(cli.filesystem, "read_file", lambda *_a, **_k: (_ for _ in ()).throw(KeyboardInterrupt()))
+def test_keyboard_interrupt_is_130(monkeypatch, capsys):
+    _canned(monkeypatch, forward=_raises(KeyboardInterrupt()))
     assert cli.main(["read_file", "--path", "f.txt"]) == EX_SIGINT
+    assert capsys.readouterr().err == "ERROR: interrupted\n"
 
 
-def test_internal_bug_is_70_with_traceback(monkeypatch, tmp_path, capsys):
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(cli.filesystem, "read_file", lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("boom")))
+def test_internal_bug_is_70_with_traceback(monkeypatch, capsys):
+    _canned(monkeypatch, forward=_raises(RuntimeError("boom")))
     assert cli.main(["read_file", "--path", "f.txt"]) == EX_SOFTWARE
     assert "RuntimeError: boom" in capsys.readouterr().err
+
+
+def test_unavailable_daemon_carries_its_own_code(monkeypatch, capsys):
+    """No daemon, no execution: the client's verdict (66 for a missing
+    workspace dir) is what the caller sees, in the usual envelope."""
+    _canned(monkeypatch, endpoint=_raises(cli.client.DaemonUnavailable("workspace is not a directory: /nope", EX_NOINPUT)))
+    assert cli.main(["--json", "read_file", "--path", "f.txt"]) == EX_NOINPUT
+    assert json.loads(capsys.readouterr().out) == {
+        "content": "workspace is not a directory: /nope",
+        "error": True,
+        "diff": "",
+    }
+
+
+def test_lost_connection_mid_command_is_74_and_never_retried(monkeypatch, capsys):
+    calls = []
+
+    def forward(base, token, command, payload):
+        calls.append(command)
+        raise cli.client.DaemonUnreachable("workspace daemon connection lost: gone")
+
+    _canned(monkeypatch, forward=forward)
+    assert cli.main(["--json", "write_file", "--path", "f.txt", "--content", "x"]) == EX_IOERR
+    assert calls == ["write_file"], "a command that may have half-happened must NOT run again"
+    assert json.loads(capsys.readouterr().out)["error"] is True
+
+
+def test_non_200_from_the_daemon_is_74(monkeypatch, capsys):
+    """403/400/404 mean no daemon spoke the protocol — transport trouble, not a
+    verdict — and there is no other path to the filesystem."""
+    _canned(monkeypatch, forward=lambda *a, **k: (403, {"content": "bad or missing token", "error": True, "diff": ""}))
+    assert cli.main(["--json", "read_file", "--path", "f.txt"]) == EX_IOERR
+    assert "bad or missing token" in json.loads(capsys.readouterr().out)["content"]

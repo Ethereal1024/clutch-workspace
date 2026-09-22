@@ -11,7 +11,7 @@ these codes (and from stderr briefs), never from parsing prose.
   70  EX_SOFTWARE internal invariant broken (bug — report it)
   74  EX_IOERR    read/write I/O failure
   77  EX_NOPERM   daemon fence refusal (path matches a --protect glob) — a
-                  flippable default; no direct-exec path raises it today
+                  flippable default; only the daemon raises it
   130 128+SIGINT  aborted by the caller
 """
 

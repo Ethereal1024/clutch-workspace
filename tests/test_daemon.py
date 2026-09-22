@@ -1,4 +1,5 @@
-"""Daemon mode: forwarding, lazy start, fallback, fence, undo, lifecycle.
+"""Daemon mode — the CLI's ONLY execution path: forwarding, lazy start,
+workspace keying, fence, undo, lifecycle.
 
 Still black-box: behavior assertions go through the real CLI as a
 subprocess (conftest's run). The client/discovery modules are imported
@@ -58,23 +59,10 @@ class Running:
 
 
 @pytest.fixture
-def daemon_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    """Rendezvous state repointed into the test's tmp dir, daemon mode ON."""
-    disc = tmp_path / "discovery"
-    monkeypatch.setenv("CLUTCH_WORKSPACE_DISCOVERY_DIR", str(disc))
-    monkeypatch.setenv("CLUTCH_WORKSPACE_NO_SERVER", "0")
-    disc.mkdir(parents=True, exist_ok=True)  # some tests write discovery files directly (stale/corrupt)
-    yield disc
-    for leftover in disc.glob("d-*.json"):  # sweep: no daemon may outlive a test
-        try:
-            payload = json.loads(leftover.read_text(encoding="utf-8"))
-            client.shutdown(f"http://127.0.0.1:{payload['port']}", payload["token"])
-        except (OSError, ValueError, KeyError):
-            pass
-
-
-@pytest.fixture
-def spawn(daemon_env):
+def spawn():
+    """Start a daemon by hand (the tests that need flags the CLI never passes,
+    like --protect). Per-test rendezvous isolation comes from conftest's
+    autouse daemon_home, which also reaps whatever survives."""
     started: list[Running] = []
 
     def _spawn(workspace: Path, *flags: str) -> Running:
@@ -118,45 +106,81 @@ def _health(base: str, token: str) -> dict:
         return json.loads(response.read().decode("utf-8"))
 
 
-# -- forwarding: the daemon must be invisible --------------------------------
+_ENVELOPE_KEYS = ("content", "error", "diff")
 
 
-def test_forwarded_output_is_byte_identical_to_direct(daemon, run, tmp_path):
+def _envelope_line(env: dict) -> str:
+    """The daemon envelope as the thin client must print it: same fields, same
+    order, same encoding — only the transport-only "code" is dropped."""
+    return json.dumps({k: env[k] for k in _ENVELOPE_KEYS}, ensure_ascii=False) + "\n"
+
+
+# -- forwarding: the CLI is a transport, not a renderer -----------------------
+
+
+def test_cli_reemits_the_daemon_envelope_byte_for_byte(daemon, run, tmp_path):
+    """The CLI adds and drops nothing: its --json stdout is the daemon's own
+    envelope minus the transport-only "code" field, and its exit status is that
+    same code. Failures travel the same road (the daemon's verdict 66 becomes
+    the exit status; the human mode prose is "ERROR: " + that same content)."""
     f = tmp_path / "f.txt"
 
-    def seed_absent():
+    def seed(text: str | None):
         f.unlink(missing_ok=True)
+        if text is not None:
+            f.write_text(text, encoding="utf-8")
 
-    def seed_v1():
-        f.write_text("v1\n", encoding="utf-8")
+    def forwarded(command: str, payload: dict) -> dict:
+        status, env = client.forward(daemon.base, daemon.token, command, payload)
+        assert status == 200, (status, env)
+        return env
 
-    def seed_v2():
-        f.write_text("v2\n", encoding="utf-8")
+    def check(command: str, payload: dict, *flags: str) -> dict:
+        """Read-only command: the daemon leg cannot disturb the CLI leg."""
+        env = forwarded(command, payload)
+        proc = run("--json", command, *flags)
+        assert (proc.returncode, proc.stdout) == (env["code"], _envelope_line(env)), flags
+        return env
 
-    def both(seed, *args: str):
-        seed()  # identical state before each leg: only the transport differs
-        via_daemon = run("--json", *args)
-        seed()
-        direct = run("--no-server", "--json", *args)
-        assert (via_daemon.returncode, via_daemon.stdout) == (direct.returncode, direct.stdout), args
+    def check_mutating(state: str | None, command: str, payload: dict, *flags: str) -> dict:
+        """Same state before each leg: the daemon runs the command first, so the
+        CLI gets a second helping of identical input."""
+        seed(state)
+        env = forwarded(command, payload)
+        seed(state)
+        proc = run("--json", command, *flags)
+        assert (proc.returncode, proc.stdout) == (env["code"], _envelope_line(env)), flags
+        return env
 
-    both(seed_absent, "write_file", "--path", "f.txt", "--content", "v1\n")
+    check("read_file", {"path": "missing.txt", "offset": 0, "limit": 0, "max_chars": 0}, "--path", "missing.txt")
+    check_mutating(None, "write_file", {"path": "f.txt", "content": "v1\n"}, "--path", "f.txt", "--content", "v1\n")
     assert f.read_text(encoding="utf-8") == "v1\n"
-    both(seed_v1, "edit_file", "--path", "f.txt", "--old-string", "v1", "--new-string", "v2")
-    both(seed_v2, "read_file", "--path", "f.txt")
-    both(seed_v2, "read_file", "--path", "f.txt", "--offset", "1", "--limit", "1")
-    both(seed_v2, "read_file", "--path", ".")  # directory listing
-    both(seed_v2, "grep", "--pattern", "v2", "--include", "*.txt")
-    both(seed_absent, "read_file", "--path", "missing.txt")  # error verdict: 66 both ways
+    check_mutating(
+        "v1\n",
+        "edit_file",
+        {"path": "f.txt", "old_string": "v1", "new_string": "v2"},
+        "--path",
+        "f.txt",
+        "--old-string",
+        "v1",
+        "--new-string",
+        "v2",
+    )
+    assert f.read_text(encoding="utf-8") == "v2\n"
+    check("read_file", {"path": "f.txt", "offset": 0, "limit": 0, "max_chars": 0}, "--path", "f.txt")
+    check("read_file", {"path": "f.txt", "offset": 1, "limit": 1, "max_chars": 0}, "--path", "f.txt", "--offset", "1", "--limit", "1")
+    check("read_file", {"path": ".", "offset": 0, "limit": 0, "max_chars": 0}, "--path", ".")  # directory listing
+    check("grep", {"pattern": "v2", "path": ".", "include": "*.txt"}, "--pattern", "v2", "--include", "*.txt")
+    check("read_file", {"path": "missing.txt", "offset": 0, "limit": 0, "max_chars": 0}, "--path", "missing.txt")
 
-    # human mode too: stdout AND the error prose on stderr must match byte-for-byte
-    seed_absent()
-    a = run("read_file", "--path", "missing.txt")
-    b = run("--no-server", "read_file", "--path", "missing.txt")
-    assert (a.returncode, a.stdout, a.stderr) == (b.returncode, b.stdout, b.stderr)
+    # human mode: stdout AND the error prose on stderr are rendered from that
+    # same envelope — never re-derived from a local attempt
+    env = forwarded("read_file", {"path": "missing.txt", "offset": 0, "limit": 0, "max_chars": 0})
+    proc = run("read_file", "--path", "missing.txt")
+    assert (proc.returncode, proc.stdout, proc.stderr) == (env["code"], "", f"ERROR: {env['content']}\n")
 
 
-def test_lazy_start_spawns_one_daemon_and_reuses_it(daemon_env, run, tmp_path):
+def test_lazy_start_spawns_one_daemon_and_reuses_it(run, tmp_path):
     assert not discovery.discovery_file(str(tmp_path)).exists()
     first = run("--json", "write_file", "--path", "a.txt", "--content", "one\n")
     assert first.returncode == 0
@@ -180,19 +204,37 @@ def test_lazy_start_spawns_one_daemon_and_reuses_it(daemon_env, run, tmp_path):
     assert not discovery.discovery_file(str(tmp_path)).exists(), "/shutdown must unpublish"
 
 
-def test_no_server_flag_and_env_kill_switch_stay_direct(daemon_env, run, tmp_path, monkeypatch):
+def test_there_is_no_in_process_path_anymore(run, tmp_path, monkeypatch):
+    """The ratchet of this refactor: --no-server is gone and no environment
+    variable can talk the CLI into touching the filesystem itself."""
     proc = run("--no-server", "--json", "write_file", "--path", "f.txt", "--content", "x")
-    assert proc.returncode == 0
-    assert (tmp_path / "f.txt").exists()
-    assert not discovery.discovery_file(str(tmp_path)).exists(), "--no-server must never publish"
+    assert proc.returncode == EX_USAGE, "--no-server must no longer parse"
+    assert not (tmp_path / "f.txt").exists()
 
-    monkeypatch.setenv("CLUTCH_WORKSPACE_NO_SERVER", "1")
+    monkeypatch.setenv("CLUTCH_WORKSPACE_NO_SERVER", "1")  # the old kill switch
     proc = run("--json", "write_file", "--path", "g.txt", "--content", "x")
     assert proc.returncode == 0
-    assert not discovery.discovery_file(str(tmp_path)).exists(), "the env kill switch must hold"
+    assert (tmp_path / "g.txt").read_text(encoding="utf-8") == "x"
+    assert discovery.discovery_file(str(tmp_path)).exists(), "every call rides a daemon, kill switch or not"
 
 
-def test_stale_and_corrupt_discovery_self_heal(daemon_env, run, tmp_path):
+def _stop_daemon(workspace: Path) -> None:
+    """Shut down whatever daemon currently serves this workspace, if its record
+    is readable. The tests below wreck that record on purpose, so the autouse
+    sweep (which needs a parseable record) cannot be relied on."""
+    record = discovery.read(str(workspace))
+    if record:
+        client.shutdown(f"http://127.0.0.1:{record['port']}", record["token"])
+
+
+def _wait_pid_gone(pid: int, timeout: float = 10.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline and discovery.pid_alive(pid):
+        time.sleep(0.05)
+    assert not discovery.pid_alive(pid), f"daemon {pid} did not stop"
+
+
+def test_stale_and_corrupt_discovery_self_heal(run, tmp_path):
     (tmp_path / "f.txt").write_text("here\n", encoding="utf-8")
     victim = subprocess.Popen([sys.executable, "-c", "pass"])
     victim.wait()
@@ -206,36 +248,55 @@ def test_stale_and_corrupt_discovery_self_heal(daemon_env, run, tmp_path):
     }
     discovery.discovery_file(str(tmp_path)).write_text(json.dumps(stale), encoding="utf-8")
 
-    proc = run("--json", "read_file", "--path", "f.txt")
-    assert proc.returncode == 0
-    healed = discovery.read(str(tmp_path))
-    assert healed and healed["pid"] != victim.pid and healed["port"] != 1, "a dead pid must be replaced by a live daemon"
+    try:
+        proc = run("--json", "read_file", "--path", "f.txt")
+        assert proc.returncode == 0
+        healed = discovery.read(str(tmp_path))
+        assert healed and healed["pid"] != victim.pid and healed["port"] != 1, (
+            "a dead pid must be replaced by a live daemon"
+        )
 
-    discovery.discovery_file(str(tmp_path)).write_text(":{not json", encoding="utf-8")
-    proc = run("--json", "read_file", "--path", "f.txt")
-    assert proc.returncode == 0, "a corrupt discovery file must never take the CLI down"
-    assert discovery.read(str(tmp_path)), "corrupt entry must be rebuilt"
+        # stop the healed daemon BEFORE wrecking its record: the corrupt write
+        # below destroys its only coordinates, and a record-less daemon can
+        # never be shut down again (it would linger until its idle watchdog)
+        _stop_daemon(tmp_path)
+        _wait_pid_gone(healed["pid"])
+
+        discovery.discovery_file(str(tmp_path)).write_text(":{not json", encoding="utf-8")
+        proc = run("--json", "read_file", "--path", "f.txt")
+        assert proc.returncode == 0, "a corrupt discovery file must never take the CLI down"
+        assert discovery.read(str(tmp_path)), "corrupt entry must be rebuilt"
+    finally:
+        _stop_daemon(tmp_path)
 
 
-def test_workspace_flag_serves_that_directory(daemon_env, run, tmp_path):
+def test_workspace_flag_keys_the_daemon_on_that_directory(run, tmp_path):
     target = tmp_path / "target"
     target.mkdir()
 
-    proc = run("--no-server", "--json", "--workspace", str(target), "write_file", "--path", "f.txt", "--content", "w")
+    proc = run("--json", "--workspace", str(target), "write_file", "--path", "f.txt", "--content", "w")
     assert proc.returncode == 0
-    assert (target / "f.txt").read_text(encoding="utf-8") == "w", "direct execution must chdir into --workspace"
+    assert (target / "f.txt").read_text(encoding="utf-8") == "w", "the daemon chdirs into --workspace"
+    assert discovery.discovery_file(str(target)).exists(), "the daemon is keyed on the --workspace dir, not the CWD"
+    assert not discovery.discovery_file(str(tmp_path)).exists(), "the CWD must not get a daemon of its own"
 
+    record = discovery.read(str(target))
     proc = run("--json", "--workspace", str(target), "read_file", "--path", "f.txt")
     assert proc.returncode == 0
     assert json.loads(proc.stdout)["content"] == "w"
-    assert discovery.discovery_file(str(target)).exists(), "the daemon is keyed on the --workspace dir, not the CWD"
+    assert discovery.read(str(target))["pid"] == record["pid"], "the second call rides the SAME daemon"
+
+    ghost = tmp_path / "ghost"
+    proc = run("--json", "--workspace", str(ghost), "read_file", "--path", "f.txt")
+    assert proc.returncode == EX_NOINPUT, "a missing --workspace dir is a hard 66: there is nothing to spawn for"
+    assert json.loads(proc.stdout)["error"] is True
 
 
 # -- fence --------------------------------------------------------------------
 
 
 def test_fence_refuses_mutations_with_77(spawn, run, tmp_path):
-    d = spawn(tmp_path, "--protect", "secret*", "--protect", "secrets/*")
+    spawn(tmp_path, "--protect", "secret*", "--protect", "secrets/*")
 
     code, env = _forward_json(run, "write_file", "--path", "secret.txt", "--content", "x")
     assert code == EX_NOPERM
@@ -355,7 +416,7 @@ def test_verdict_rides_http_200(daemon):
 # -- lifecycle -----------------------------------------------------------------
 
 
-def test_idle_suicide_unpublishes(daemon_env, tmp_path):
+def test_idle_suicide_unpublishes(tmp_path):
     proc = subprocess.Popen(
         [sys.executable, "-m", "clutch_workspace.daemon", "--workspace", str(tmp_path), "--idle", "1"],
         cwd=str(tmp_path),
@@ -376,7 +437,7 @@ def test_idle_suicide_unpublishes(daemon_env, tmp_path):
             proc.wait(timeout=10)
 
 
-def test_shutdown_via_flag_stops_cleanly(daemon_env, tmp_path):
+def test_shutdown_via_flag_stops_cleanly(tmp_path):
     proc = subprocess.Popen(
         [sys.executable, "-m", "clutch_workspace.daemon", "--workspace", str(tmp_path), "--port", "0"],
         cwd=str(tmp_path),

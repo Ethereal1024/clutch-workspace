@@ -1,7 +1,7 @@
 [project]
 name = "clutch-workspace"
 version = "0.2.0"
-description = "Standalone file-inspection CLI: read_file / grep / write_file / edit_file as plain flags-in, text-out commands, optionally riding a per-workspace daemon."
+description = "Standalone file-inspection CLI: read_file / grep / write_file / edit_file as plain flags-in, text-out commands, executed by a per-workspace daemon."
 requires-python = ">=3.10"
 license = "MIT"
 dependencies = []

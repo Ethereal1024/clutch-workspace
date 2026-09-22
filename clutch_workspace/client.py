@@ -1,18 +1,15 @@
-"""Thin-client plumbing: find (or lazily start) the workspace daemon, forward
-one command over HTTP, and map the response back onto the CLI's contract.
+"""Thin-client plumbing: find (or lazily start) the workspace daemon and
+forward one command over HTTP.
 
-Policy (ratified):
-- Lazy start: with no live daemon for the workspace, the first CLI call
-  spawns one detached and waits up to LAZY_START_SECONDS for it to publish
-  itself; the command then rides the daemon.
-- Silent fallback: if there is no daemon and one cannot be started —
-  workspace dir missing, spawn failed, port lost — the command simply runs
-  in-process, byte-identically. The daemon is an accelerator, never a
-  dependency; only `--no-server` / CLUTCH_WORKSPACE_NO_SERVER=1 force that
-  path from the start.
-- A daemon that dies MID-command is NOT retried locally: the command may
-  have half-happened and the commands are not all idempotent (edit_file
-  is not), so a lost connection surfaces as exit 74 instead.
+Policy (ratified): the daemon IS the CLI's execution engine. Every command
+rides the per-workspace daemon; when none is alive the first CLI call spawns
+one detached and waits up to LAZY_START_SECONDS for it to publish itself.
+There is NO in-process fallback — a command that cannot reach or start a
+daemon fails with a sysexits code (66 for a missing workspace dir, 74 for
+any other unavailable daemon) instead of quietly executing locally.
+A daemon that dies MID-command is NOT retried either: the command may have
+half-happened and the commands are not all idempotent (edit_file is not), so
+a lost connection surfaces as exit 74.
 
 Stdlib only (urllib, subprocess, secrets) — the zero-dependency promise
 holds; the daemon must never import the host repo's procmgr.
@@ -30,6 +27,7 @@ import urllib.request
 from pathlib import Path
 
 from . import discovery
+from .exitcodes import EX_IOERR, EX_NOINPUT
 
 LAZY_START_SECONDS = 10.0  # how long a client waits for a daemon it just spawned
 PROBE_TIMEOUT = 2.0  # /health budget — a live daemon answers instantly
@@ -41,16 +39,22 @@ class DaemonUnreachable(Exception):
     """The daemon accepted the connection but died before answering."""
 
 
-def disabled() -> bool:
-    """The environment kill switch: CLUTCH_WORKSPACE_NO_SERVER=1 forces the
-    direct path everywhere (tests set this so the default suite stays
-    in-process; --no-server is the per-call spelling)."""
-    return os.environ.get("CLUTCH_WORKSPACE_NO_SERVER", "").strip().lower() in ("1", "true", "yes", "on")
+class DaemonUnavailable(Exception):
+    """No usable daemon for this workspace and none could be started. The CLI
+    has no other way to execute a command, so this is a hard failure carrying
+    the sysexits code the CLI exits with."""
+
+    def __init__(self, message: str, code: int = EX_IOERR) -> None:
+        super().__init__(message)
+        self.code = code
 
 
-def endpoint(workspace: str) -> tuple[str, str] | None:
-    """(base_url, token) for this workspace's daemon — probing first, lazy-
-    starting once when absent, None when the direct path should take over."""
+def endpoint(workspace: str) -> tuple[str, str]:
+    """(base_url, token) for this workspace's daemon, lazy-starting one when
+    absent. Raises DaemonUnavailable when there is no daemon and none can be
+    started — the daemon is the CLI's only execution path."""
+    if not os.path.isdir(workspace):
+        raise DaemonUnavailable(f"workspace is not a directory: {workspace}", EX_NOINPUT)
     record = discovery.read(workspace)
     if record and _healthy(record):
         return _base(record), record["token"]
@@ -101,12 +105,6 @@ def shutdown(base: str, token: str) -> None:
         pass
 
 
-def forget(workspace: str) -> None:
-    """Drop the discovery entry (403/404/5xx: the daemon is not usable as
-    published — the next call lazy-starts a fresh one)."""
-    discovery.remove(workspace)
-
-
 def _healthy(record: dict) -> bool:
     try:
         request = urllib.request.Request(_base(record) + "/health", headers={_TOKEN_HEADER: record["token"]})
@@ -120,23 +118,23 @@ def _base(record: dict) -> str:
     return f"http://127.0.0.1:{record['port']}"
 
 
-def _spawn_and_wait(workspace: str) -> tuple[str, str] | None:
+def _spawn_and_wait(workspace: str) -> tuple[str, str]:
     """Start one detached daemon for this workspace and poll for its
-    discovery entry. Any failure here is 'no daemon', never an error — the
-    caller falls back to direct execution without a word."""
+    discovery entry. Any failure here is fatal: with no daemon there is no
+    way to run the command."""
     try:
         child = _spawn(workspace)
-    except OSError:
-        return None
+    except OSError as err:
+        raise DaemonUnavailable(f"could not start the workspace daemon: {err}") from None
     deadline = time.monotonic() + LAZY_START_SECONDS
     while time.monotonic() < deadline:
         if child.poll() is not None:
-            return None  # died on startup (bad flags, missing dir): don't wait out the clock
+            raise DaemonUnavailable(f"the workspace daemon exited during startup (status {child.returncode})")
         record = discovery.read(workspace)
         if record and _healthy(record):
             return _base(record), record["token"]
         time.sleep(0.05)
-    return None
+    raise DaemonUnavailable(f"the workspace daemon did not become ready within {LAZY_START_SECONDS:g}s")
 
 
 def _spawn(workspace: str) -> subprocess.Popen:
