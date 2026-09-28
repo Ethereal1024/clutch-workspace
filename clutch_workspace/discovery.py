@@ -15,7 +15,9 @@ parallel checkouts can repoint it with CLUTCH_WORKSPACE_DISCOVERY_DIR.
 
 Daemons idle out after ~10 minutes, so discovery files routinely outlive
 their daemon; a read that finds a dead pid removes the stale file and
-returns None (the client then lazy-starts a fresh daemon). Everything here
+returns None (the client then lazy-starts a fresh daemon). A daemon removes
+the file on its way out only while it still names it (remove(..., pid=…)):
+a daemon that was replaced cannot unpublish its replacement. Everything here
 is stdlib only — the zero-dependency promise holds.
 """
 
@@ -95,8 +97,24 @@ def read(workspace: str) -> dict | None:
     return payload
 
 
-def remove(workspace: str) -> None:
-    discovery_file(workspace).unlink(missing_ok=True)
+def remove(workspace: str, pid: int | None = None) -> None:
+    """Unpublish this workspace's record.
+
+    `pid` guards the removal on whose record this is: a daemon that was replaced
+    while it was still running must not delete its SUCCESSOR's record on the way
+    out (the file now names the replacement, and the next client would find
+    nothing and start yet another one). Callers that are the daemon itself pass
+    its own pid; a caller that owns the record another way passes nothing.
+    """
+    path = discovery_file(workspace)
+    if pid is not None:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        if not isinstance(payload, dict) or payload.get("pid") != pid:
+            return
+    path.unlink(missing_ok=True)
 
 
 def _wellformed(payload: object) -> bool:

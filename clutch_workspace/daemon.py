@@ -44,7 +44,9 @@ and broad scans, not deliberate access.
 
 Lifecycle: an idle watchdog exits the daemon after --idle seconds without
 any request (default 600 ≈ 10 minutes), SIGTERM/SIGINT exit gracefully,
-and both paths remove the discovery file. A crash leaves the file behind,
+and both paths remove the discovery file — only while it still names THIS
+daemon (remove(..., pid=…)): one that was replaced while it was still
+running must not unpublish its replacement. A crash leaves the file behind,
 but the client's pid-liveness probe treats it as stale, so nothing hangs
 on it.
 """
@@ -393,7 +395,7 @@ def serve(args: argparse.Namespace) -> int:
         httpd.serve_forever(poll_interval=0.5)
     finally:
         httpd.server_close()
-        discovery.remove(str(workspace))
+        discovery.remove(str(workspace), pid=daemon.pid)
         print(f"clutch-workspace daemon stopped: workspace={workspace}", flush=True)
     return 0
 
