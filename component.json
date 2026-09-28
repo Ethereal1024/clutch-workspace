@@ -12,6 +12,7 @@
   "prefix": "d-",
   "requires": ["python", "posix-shell", "curl"],
   "ui": { "label": "workspace files", "status": true },
+  "prompt": "PROMPT.md",
   "tools": [
     {
       "name": "read_file",
