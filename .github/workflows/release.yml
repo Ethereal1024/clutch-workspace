@@ -1,0 +1,77 @@
+# This component's whole release. A tag names a version, and the release carries
+# everything a client needs to install this component on a MACHINE:
+#
+#   clutch-workspace.tar.gz  the artifact: this repo's tree, top level as its root
+#   component.json           the declaration, as published (it also travels inside
+#                            the tar; publishing it beside the manifest is what lets
+#                            a client hand a host the declaration without the bytes)
+#   clutch-component.json    the manifest naming both, with their sha256
+#
+# The HOST repo holds none of this. It stores one URL — this release's manifest —
+# in ui/components.sources.json, and that is the entire coupling between the two
+# (host's COMPONENTS.md §一). So this workflow owns the artifact's shape, the
+# digest that pins it, and the version it declares: nothing here asks the host.
+#
+# `permissions: contents: write` is all a release needs — the run's own
+# GITHUB_TOKEN may create one, no personal token and no third-party action.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The manifest's version comes from component.json, so the tag must agree
+      # with it: a release whose tag says one thing and whose declaration says
+      # another is not reproducible, and the manifest would be the lie.
+      - name: The tag and the declaration name the same version
+        run: |
+          set -euo pipefail
+          declared="$(python3 -c 'import json;print(json.load(open("component.json"))["version"])')"
+          if [ "v$declared" != "${GITHUB_REF_NAME}" ]; then
+            echo "tag ${GITHUB_REF_NAME} does not match component.json ${declared}" >&2
+            exit 1
+          fi
+
+      - name: Tests
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet pytest
+          python3 -m pytest -q
+
+      # `git archive` of the tagged commit: members sit at the archive's TOP
+      # level, because the install directory IS the component's own directory
+      # (the host unpacking members elsewhere refuses the archive). Tracked files
+      # only, so no venv, no cache, no editor leftovers can ride along.
+      - name: The artifact
+        run: |
+          set -euo pipefail
+          git archive --format=tar.gz --output=clutch-workspace.tar.gz HEAD
+          tar -tzf clutch-workspace.tar.gz | head -20
+
+      - name: The manifest
+        run: |
+          set -euo pipefail
+          python3 scripts/release-manifest.py clutch-workspace.tar.gz component.json clutch-component.json
+          cat clutch-component.json
+
+      # `latest` in the host's source URL is GitHub's latest non-prerelease
+      # release, which is exactly what this creates: a full release, not a draft,
+      # not a pre-release. Publish it only when both digests are in hand.
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            clutch-workspace.tar.gz component.json clutch-component.json
