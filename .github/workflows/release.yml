@@ -55,7 +55,11 @@ jobs:
         run: |
           set -euo pipefail
           git archive --format=tar.gz --output=clutch-workspace.tar.gz HEAD
-          tar -tzf clutch-workspace.tar.gz | head -20
+          # List it whole — NOT through `head`: `set -o pipefail` above turns the
+          # SIGPIPE that `head` leaves behind (tar exits 141 once the reader is
+          # gone) into a failed step, so a component with more members than the
+          # reader asked for would fail its own release.
+          tar -tzf clutch-workspace.tar.gz
 
       - name: The manifest
         run: |
