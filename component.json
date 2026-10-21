@@ -1,15 +1,16 @@
 {
   "name": "clutch-workspace",
-  "version": "0.1.0",
-  "interface": "daemon",
+  "version": "0.1.1",
   "subject": "workspace-fs",
+  "service": {
+    "discovery_env": "CLUTCH_WORKSPACE_DISCOVERY_DIR",
+    "app_dir": "clutch-workspace",
+    "prefix": "d-"
+  },
   "launch": {
     "argv": ["{py}", "-m", "clutch_workspace.daemon"],
     "importable": true
   },
-  "discovery_env": "CLUTCH_WORKSPACE_DISCOVERY_DIR",
-  "app_dir": "clutch-workspace",
-  "prefix": "d-",
   "requires": ["python", "posix-shell", "curl"],
   "ui": { "label": "workspace files", "status": true },
   "prompt": "PROMPT.md",

@@ -8,9 +8,10 @@
 #   clutch-component.json    the manifest naming both, with their sha256
 #
 # The HOST repo holds none of this. It stores one URL — this release's manifest —
-# in ui/components.sources.json, and that is the entire coupling between the two
-# (host's COMPONENTS.md §一). So this workflow owns the artifact's shape, the
-# digest that pins it, and the version it declares: nothing here asks the host.
+# as this module's line in market/entries.json, and that is the entire coupling
+# between the two (scripts/market_index.py turns those lines into the one index
+# every client reads). So this workflow owns the artifact's shape, the digest
+# that pins it, and the version it declares: nothing here asks the host.
 #
 # `permissions: contents: write` is all a release needs — the run's own
 # GITHUB_TOKEN may create one, no personal token and no third-party action.
