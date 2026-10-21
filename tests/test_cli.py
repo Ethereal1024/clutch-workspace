@@ -6,6 +6,7 @@ run main() in-process against a canned transport. There is no in-process
 execution path left, so those tests patch the client, never the filesystem.
 """
 
+import io
 import json
 import sys
 
@@ -83,7 +84,12 @@ class _DeadPipe:
         raise BrokenPipeError
 
     def fileno(self):
-        raise ValueError  # keeps the dup2 cleanup away from the real fd 1
+        # Both audiences have to be answered here, which is why this is
+        # UnsupportedOperation (OSError AND ValueError) rather than either alone:
+        # the dup2 cleanup must not be handed the real fd 1, and argparse's
+        # colour probe (python 3.14 `_colorize.can_colorize`, which catches
+        # OSError only) has to read this as "not a tty" instead of dying on it.
+        raise io.UnsupportedOperation("a dead pipe has no file descriptor")
 
     def reconfigure(self, **_kw):
         pass
