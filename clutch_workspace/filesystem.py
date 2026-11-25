@@ -112,7 +112,8 @@ def write_file(path: str, content: str) -> Result:
     p.parent.mkdir(parents=True, exist_ok=True)
     # newline="\n": byte-exact on every host (the host's LocalWorkspace rule —
     # Windows text mode must not expand \n into \r\n)
-    p.write_text(content, encoding="utf-8", newline="\n")
+    with open(p, "w", encoding="utf-8", newline="\n") as f:
+        f.write(content)
     rel = _rel(p)
     diff = _unified_diff(old, content, rel)
     adds, dels = _count_changes(diff)
@@ -139,7 +140,8 @@ def edit_file(path: str, old_string: str, new_string: str) -> Result:
     if count > 1:
         raise CommandError(EX_DATAERR, f"old_string appears {count} times in {path}")
     new = text.replace(old_string, new_string, 1)
-    p.write_text(new, encoding="utf-8", newline="\n")
+    with open(p, "w", encoding="utf-8", newline="\n") as f:
+        f.write(new)
     diff = _unified_diff(text, new, _rel(p))
     adds, dels = _count_changes(diff)
     return Result(f"OK: edited {path} (+{adds} -{dels} lines)", diff=diff)
@@ -220,7 +222,8 @@ def restore(path: str, content: str | None) -> str:
         p.unlink(missing_ok=True)
         return f"OK: undid {path} (created file removed)"
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(content, encoding="utf-8", newline="\n")
+    with open(p, "w", encoding="utf-8", newline="\n") as f:
+        f.write(content)
     return f"OK: undid {path} (restored {len(content)} chars)"
 
 

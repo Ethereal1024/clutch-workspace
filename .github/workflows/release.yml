@@ -25,7 +25,34 @@ permissions:
   contents: write
 
 jobs:
+  # The suite on both ends of the range a client may run: the floor this
+  # component declares (3.8, the python a Ubuntu 20.04 box boots with) and the
+  # runner's own interpreter. One leg was not enough, and it cost a release's
+  # worth of trust: the suite ran only on the runner (3.12), so a 3.9-only
+  # helper lived in `tests/` unremarked — green here, AttributeError for the
+  # developer on the machine the floor exists for.
+  tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.8", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Tests
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet pytest
+          python -m pytest -q
+
+  # The artifact is built by the runner's own python, not by the floor leg: what
+  # ships is bytes, and `git archive` plus one hashlib do not care which
+  # interpreter produces them.
   release:
+    needs: tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -41,12 +68,6 @@ jobs:
             echo "tag ${GITHUB_REF_NAME} does not match component.json ${declared}" >&2
             exit 1
           fi
-
-      - name: Tests
-        run: |
-          set -euo pipefail
-          python3 -m pip install --quiet pytest
-          python3 -m pytest -q
 
       # `git archive` of the tagged commit: members sit at the archive's TOP
       # level, because the install directory IS the component's own directory

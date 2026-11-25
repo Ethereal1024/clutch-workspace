@@ -2,7 +2,7 @@
 name = "clutch-workspace"
 version = "0.2.0"
 description = "Standalone file-inspection CLI: read_file / grep / write_file / edit_file as plain flags-in, text-out commands, executed by a per-workspace daemon."
-requires-python = ">=3.10"
+requires-python = ">=3.8"
 license = "MIT"
 dependencies = []
 
@@ -21,7 +21,7 @@ dev = ["pytest>=8.0"]
 
 [tool.ruff]
 line-length = 120
-target-version = "py310"
+target-version = "py38"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "B", "I"]

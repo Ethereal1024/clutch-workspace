@@ -7,6 +7,8 @@ autouse fixture below gives each test its own discovery directory and shuts
 down whatever daemons it lazy-started.
 """
 
+from __future__ import annotations
+
 import json
 import os
 import subprocess

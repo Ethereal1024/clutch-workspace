@@ -8,6 +8,8 @@ HTTP surface is exercised with raw requests where the CLI can't reach
 (undo is HTTP-only by decision; 403/404/400 guards).
 """
 
+from __future__ import annotations
+
 import json
 import os
 import subprocess
