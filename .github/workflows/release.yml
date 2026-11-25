@@ -32,7 +32,10 @@ jobs:
   # helper lived in `tests/` unremarked — green here, AttributeError for the
   # developer on the machine the floor exists for.
   tests:
-    runs-on: ubuntu-latest
+    # ubuntu-22.04, not -latest: `actions/setup-python` has no 3.8 in its tool
+    # cache for 24.04, and this leg died in "Set up Python" there before running
+    # a single test. 22.04 is the newest image that still carries 3.8.
+    runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
       matrix:
